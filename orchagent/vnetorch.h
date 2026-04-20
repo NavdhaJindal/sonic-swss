@@ -455,6 +455,7 @@ struct VNetTunnelRouteEntry
     // routes they wil lcontain the origna lprimary and secondary NHGs.
     NextHopGroupKey primary;
     NextHopGroupKey secondary;
+    uint16_t consistent_hashing_buckets = 0;
 };
 
 struct VNetLocEpAclRule
@@ -544,9 +545,9 @@ private:
                             const string& monitoring, const int32_t rx_monitor_timer, const int32_t tx_monitor_timer,
                             IpPrefix& ipPrefix);
     void delEndpointMonitor(const string& vnet, NextHopGroupKey& nexthops, IpPrefix& ipPrefix);
-    void postRouteState(const string& vnet, IpPrefix& ipPrefix, NextHopGroupKey& nexthops, string& profile);
+    void postRouteState(const string& vnet, IpPrefix& ipPrefix, NextHopGroupKey& nexthops, const string& profile);
     void removeRouteState(const string& vnet, IpPrefix& ipPrefix);
-    void addRouteAdvertisement(IpPrefix& ipPrefix, string& profile);
+    void addRouteAdvertisement(IpPrefix& ipPrefix, const string& profile);
     void removeRouteAdvertisement(IpPrefix& ipPrefix);
 
     void updateVnetTunnel(const BfdUpdate&);
@@ -562,11 +563,8 @@ private:
     bool doRouteTask(const string& vnet, IpPrefix& ipPrefix, NextHopGroupKey& nexthops, string& op, string& profile,
                     const string& monitoring, const int32_t rx_monitor_timer, const int32_t tx_monitor_timer,
                     NextHopGroupKey& nexthops_secondary, const IpPrefix& adv_prefix,
+                    const uint16_t consistent_hashing_buckets = 0,
                     const std::map<NextHopKey, IpAddress>& monitors=std::map<NextHopKey, IpAddress>());
-
-    template<typename T>
-    bool doRouteTask(const string& vnet, IpPrefix& ipPrefix, NextHopGroupKey& nexthops, string& op,
-                    const uint16_t consistent_hashing_buckets);
 
     template<typename T>
     bool doRouteTask(const string& vnet, IpPrefix& ipPrefix, nextHop& nh, string& op);
