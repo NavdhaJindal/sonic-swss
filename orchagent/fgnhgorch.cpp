@@ -1706,10 +1706,10 @@ bool FgNhgOrch::setFgNhgTunnel(sai_object_id_t vrf_id, const IpPrefix &ipPrefix,
         return true;
     }
 
-    if (!validateFgNhgMemberCount(nhopgroup_members_set.size(), bucket_size, fg_nhg_name))
-    {
-        return false;
-    }
+    // if (!validateFgNhgMemberCount(nhopgroup_members_set.size(), bucket_size, fg_nhg_name))
+    // {
+    //     return false;
+    // }
 
     FgNhgEntry fgNhgEntry;
     fgNhgEntry.configured_bucket_size = bucket_size;
