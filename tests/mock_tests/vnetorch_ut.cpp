@@ -242,15 +242,9 @@ namespace vnetorch_test
             sai_object_id_t nh = SAI_NULL_OBJECT_ID;
             bool has_seq = false;
             uint32_t seq = 0;
-            // SAI_NEXT_HOP_GROUP_MEMBER_ATTR_INDEX: the FG-ECMP hash bucket index
-            // this member occupies (fgnhgorch.cpp sprayBankNhgMembers). Absent for
-            // regular ECMP members.
             bool has_index = false;
             uint32_t index = 0;
         };
-        // A later in-place reassignment of an existing FG-ECMP member's next hop
-        // (fgnhgorch.cpp writeHashBucketChange uses set_next_hop_group_member_attribute,
-        // not create/remove, so redistribution isn't visible in `members` alone).
         struct MemberNhUpdate
         {
             sai_object_id_t member = SAI_NULL_OBJECT_ID;
@@ -542,6 +536,10 @@ namespace vnetorch_test
         // producer writes the same way syncBfd() diffs BFD sessions.
         set<string> m_deliveredDecapTermKeys;
 
+        // Prior value of the process-global "platform" env var
+        bool m_platformWasSet = false;
+        string m_savedPlatform;
+
         void SetUp() override
         {
             // gDB (the mock DB backing swss::Table) is process-global and is not
@@ -550,7 +548,27 @@ namespace vnetorch_test
             // be re-consumed by the next test's addExistingData()+doTask(),
             // inflating the captured SAI object counts. Reset before each test.
             testing_db::reset();
+
+            const char *platform = getenv("platform");
+            m_platformWasSet = (platform != nullptr);
+            m_savedPlatform = m_platformWasSet ? platform : "";
+            setenv("platform", VS_PLATFORM_SUBSTRING, 1);
+
             MockOrchTest::SetUp();
+        }
+
+        void TearDown() override
+        {
+            MockOrchTest::TearDown();
+
+            if (m_platformWasSet)
+            {
+                setenv("platform", m_savedPlatform.c_str(), 1);
+            }
+            else
+            {
+                unsetenv("platform");
+            }
         }
 
         // Runs inside PrepareSai(), before any Orch (incl. gRouteOrch) is built.
@@ -947,10 +965,7 @@ namespace vnetorch_test
                 }));
             // FgNhgOrch reassigns a hash bucket to a different endpoint in place
             // (writeHashBucketChange, fgnhgorch.cpp) via a SET on the existing
-            // member's NEXT_HOP_ID rather than removing/recreating the member --
-            // bucket_size stays fixed across endpoint churn, only the mapping
-            // changes. Capture those SETs so FG-ECMP redistribution tests can
-            // reconstruct each member's *current* next hop.
+            // member's NEXT_HOP_ID rather than removing/recreating the member 
             ON_CALL(*mock_sai_next_hop_group_api, set_next_hop_group_member_attribute(_, _))
                 .WillByDefault(Invoke([this](sai_object_id_t id, const sai_attribute_t *attr) {
                     sai_status_t st = old_sai_next_hop_group_api->set_next_hop_group_member_attribute(id, attr);
@@ -1145,8 +1160,6 @@ namespace vnetorch_test
                                    APP_VNET_RT_TUNNEL_TABLE_NAME, vnet, prefix, fvs);
         }
 
-        // A VNET tunnel route programmed as fine-grained ECMP -- the mock
-        // equivalent of vnet_lib.create_vnet_routes(..., consistent_hashing_buckets=N).
         void setVnetFgEcmpRoute(const string &vnet, const string &prefix,
                                 const string &endpoints, uint32_t bucketSize)
         {
@@ -1853,15 +1866,12 @@ namespace vnetorch_test
                 << "STATE_DB route " << vnet << "|" << prefix << " not removed";
         }
 
-        // -- FG-ECMP (fine-grained ECMP) helpers for VNET tunnel routes --
         // FgNhgOrch::getWarmRebootStateDbKey(vnet, prefix) = "vnet|prefix".
         static string fgStateDbKey(const string &vnet, const string &prefix)
         {
             return vnet + "|" + prefix;
         }
 
-        // Presence check for STATE_DB FG_ROUTE_TABLE -- the mock equivalent of
-        // the VS test's state_db.wait_for_n_keys("FG_ROUTE_TABLE", ...).
         bool fgRouteStateDbRowExists(const string &vnet, const string &prefix)
         {
             Table tbl(m_state_db.get(), STATE_FG_ROUTE_TABLE_NAME);
@@ -1877,9 +1887,6 @@ namespace vnetorch_test
                 << "STATE_DB FG_ROUTE_TABLE row " << fgStateDbKey(vnet, prefix) << " not removed";
         }
 
-        // The tunnel-encap next hop OID currently programmed for an endpoint --
-        // the last captured create for that IP that hasn't since been removed
-        // (an endpoint that churns out and back in gets a fresh OID).
         sai_object_id_t nhOidForEndpoint(const string &ip) const
         {
             sai_object_id_t oid = SAI_NULL_OBJECT_ID;
@@ -1894,11 +1901,7 @@ namespace vnetorch_test
             return oid;
         }
 
-        // Reconstructs the *current* endpoint assignment of every FG-ECMP hash
-        // bucket (member) of `nhg`: starts from each member's next hop at
-        // creation, then replays every later set_next_hop_group_member_attribute
-        // reassignment (FgNhgOrch::writeHashBucketChange) in issue order. Unlike
-        // regular VNET ECMP, FG-ECMP keeps the same member OIDs (and the same
+        // Unlike regular VNET ECMP, FG-ECMP keeps the same member OIDs (and the same
         // NHG OID) across endpoint-set changes -- only the mapping moves.
         map<sai_object_id_t, sai_object_id_t> currentFgMemberAssignments(sai_object_id_t nhg) const
         {
@@ -1918,9 +1921,7 @@ namespace vnetorch_test
             return assignment;
         }
 
-        // Groups `nhg`'s current bucket assignment by endpoint IP -- the mock
-        // equivalent of test_fgnhg.py's ASIC_DB member-count-per-nexthop
-        // validation (nh_memb_exp_count in test_vnet_fg_ecmp).
+        // Groups nhg's current bucket assignment by endpoint IP
         map<string, int> fgMemberCountsByEndpoint(sai_object_id_t nhg,
                                                   const vector<string> &endpoints) const
         {
@@ -2677,12 +2678,8 @@ namespace vnetorch_test
     }
 
     // A VNET_ROUTE_TUNNEL entry with consistent_hashing_buckets > 0 is
-    // programmed as fine-grained ECMP (VNetRouteOrch::selectFgNextHopGroup ->
-    // FgNhgOrch::setFgNhgTunnel, fgnhgorch.cpp) instead of regular dynamic
-    // ECMP: a single SAI_NEXT_HOP_GROUP_TYPE_FINE_GRAIN_ECMP group with exactly
-    // `bucket_size` members, evenly split across the endpoints -- the mock
-    // equivalent of test_vnet.py::test_vnet_fg_ecmp's initial 3-endpoint/
-    // 60-bucket phase (20/20/20).
+    // programmed as fine-grained ECMP with exactly
+    // `bucket_size` members, evenly split across the endpoints
     TEST_F(VNetOrchTest, VnetFgEcmpRouteProgramsFineGrainedGroup)
     {
         setVxlanTunnel("tunnel_37", "10.10.10.10");
@@ -2712,10 +2709,7 @@ namespace vnetorch_test
     }
 
     // Growing the endpoint set on an already-FG-ECMP route (same bucket_size)
-    // redistributes the existing 60 buckets across all 6 endpoints in place --
-    // no new NHG, no new members, just set_next_hop_group_member_attribute
-    // reassignments (FgNhgOrch::writeHashBucketChange) -- the mock equivalent
-    // of test_vnet_fg_ecmp's "Add 3 more nexthops" phase (10 each).
+    // redistributes the existing 60 buckets across all 6 endpoints in place
     TEST_F(VNetOrchTest, VnetFgEcmpRouteRedistributesOnEndpointAdd)
     {
         setVxlanTunnel("tunnel_37", "10.10.10.10");
@@ -2745,9 +2739,7 @@ namespace vnetorch_test
     }
 
     // Swapping out endpoints (same count, same bucket_size) reassigns only the
-    // buckets that were pointing at the departed endpoints -- the mock
-    // equivalent of test_vnet_fg_ecmp's "Update route with different
-    // endpoints" phase (37.0.0.5/.6 replaced by 37.0.0.7/.8).
+    // buckets that were pointing at the departed endpoints
     TEST_F(VNetOrchTest, VnetFgEcmpRouteRedistributesOnEndpointUpdate)
     {
         setVxlanTunnel("tunnel_37", "10.10.10.10");
@@ -2777,9 +2769,7 @@ namespace vnetorch_test
     }
 
     // Shrinking the endpoint set (same bucket_size) redistributes the buckets
-    // that belonged to the removed endpoint across the survivors -- the mock
-    // equivalent of test_vnet_fg_ecmp's "Remove one endpoint" phase (12 each
-    // across the remaining 5).
+    // that belonged to the removed endpoint across the survivors
     TEST_F(VNetOrchTest, VnetFgEcmpRouteRedistributesOnEndpointRemove)
     {
         setVxlanTunnel("tunnel_37", "10.10.10.10");
@@ -2808,15 +2798,8 @@ namespace vnetorch_test
                           "37.0.0.1,37.0.0.2,37.0.0.3,37.0.0.4,37.0.0.7");
     }
 
-    // Two different VNETs can each have an FG-ECMP route on the identical
-    // prefix *string*: FgNhgOrch's fg_nhg_name embeds the vrf_id
-    // ("FG_NHG_" + vrf_id + "_" + prefix), so the two routes get independent
-    // NHGs, member sets and STATE_DB FG_ROUTE_TABLE rows (keyed
-    // "vnet|prefix") despite the shared prefix -- the mock equivalent of
-    // test_vnet_fg_ecmp's Vnet37/Vnet38-share-a-prefix phase. This is also the
-    // regression scenario for the cross-prefix NHG-cache-aliasing trouble spot
-    // (syncd_nexthop_groups_ keyed only by endpoint set): unrelated prefixes
-    // sharing an endpoint set must not clobber each other's cached NHG id.
+    // Two different VNETs can each have an FG-ECMP route on the identical prefix
+    // unrelated prefixes sharing an endpoint set must not clobber each other's cached NHG id.
     TEST_F(VNetOrchTest, VnetFgEcmpTwoVnetsShareSamePrefix)
     {
         setVxlanTunnel("tunnel_37", "10.10.10.10");
@@ -2839,9 +2822,7 @@ namespace vnetorch_test
         const sai_object_id_t nhg2 = m_rt.groups[1].oid;
         EXPECT_NE(nhg1, nhg2);
 
-        // Each group still has its own 60 members, correctly split 20/20/20
-        // across its own VNET's endpoints -- neither route's cache/assignment
-        // was clobbered by the other's identical prefix string.
+        // Each group still has its own 60 members
         EXPECT_EQ(currentFgMemberAssignments(nhg1).size(), 60U);
         EXPECT_EQ(currentFgMemberAssignments(nhg2).size(), 60U);
         auto counts1 = fgMemberCountsByEndpoint(nhg1, endpoints1);
@@ -2850,8 +2831,7 @@ namespace vnetorch_test
         for (const auto &ip : endpoints2) EXPECT_EQ(counts2[ip], 20) << "Vnet38 endpoint " << ip;
 
         // Both routes share the identical prefix string, so they must be
-        // told apart by virtual router, not by findRoute() (which matches on
-        // dest address alone across every VRF).
+        // told apart by virtual router
         const RouteCaptures::Route *r1 = nullptr;
         const RouteCaptures::Route *r2 = nullptr;
         for (const auto &r : m_rt.routes)
@@ -2873,10 +2853,7 @@ namespace vnetorch_test
 
     // Deleting an FG-ECMP route removes its NHG, all of its members and its
     // tunnel next hops, and clears both the VNET_ROUTE_TUNNEL_TABLE and
-    // FG_ROUTE_TABLE STATE_DB rows -- the mock equivalent of
-    // test_vnet_fg_ecmp's final cleanup (asic_db.wait_for_n_keys(ASIC_NHG_MEMB/
-    // ASIC_NHG, 0), wait_for_n_keys(vnet_obj.ASIC_NEXT_HOP, initial_nhop_count),
-    // state_db.wait_for_n_keys("FG_ROUTE_TABLE", 0)).
+    // FG_ROUTE_TABLE STATE_DB rows
     TEST_F(VNetOrchTest, VnetFgEcmpRouteCleanupRemovesAllObjects)
     {
         setVxlanTunnel("tunnel_37", "10.10.10.10");
